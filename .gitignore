@@ -1,0 +1,16 @@
+# Local Python environment and generated package metadata.
+.venv/
+.venv*/
+venv/
+*.egg-info/
+__pycache__/
+*.py[cod]
+
+# Downloaded benchmark data, generated results, and credentials.
+dataset/
+data/
+results*/
+invalid_runs/
+.env
+.env.*
+!.env.example
