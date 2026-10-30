@@ -1,0 +1,21 @@
+{
+  "selection_seed": 2026,
+  "excluded_dev_set": [
+    "scenario-003",
+    "scenario-006",
+    "scenario-008",
+    "scenario-009"
+  ],
+  "held_out": [
+    "scenario-031",
+    "scenario-035",
+    "scenario-062",
+    "scenario-086",
+    "scenario-133",
+    "scenario-136",
+    "scenario-158",
+    "scenario-170",
+    "scenario-225",
+    "scenario-231"
+  ]
+}

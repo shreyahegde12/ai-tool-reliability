@@ -59,6 +59,9 @@ agentic:
     force_final_verification: true
     selective_rollback: true
     net_benefit_ratio: "strict"    # "strict" = zero-tolerance; float = accept when fixed_delta >= ratio * regression_delta
+  diagnosis:
+    enabled: false                 # Adds the deterministic `diagnose` tool
+    prefill: true                  # Put the initial report in the first task message
 
 # LLM-as-judge diagnosis scoring
 diagnosis_judge:

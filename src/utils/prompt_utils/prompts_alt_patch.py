@@ -407,15 +407,32 @@ AGENT_TOOL_DEFINITIONS = [
 ]
 
 
-def _format_agent_tool_descriptions() -> str:
+DIAGNOSE_TOOL_DEFINITION = {
+    "name": "diagnose",
+    "description": (
+        "Run deterministic cross-device consistency checks (BGP peering, "
+        "link addressing, interface state, OSPF adjacency, prefix "
+        "origination) on the current network state. Returns ranked "
+        "root-cause hypotheses with evidence and suggested fixes. "
+        "Cheap; re-run after patching to see whether an inconsistency is resolved."
+    ),
+    "parameters": {},
+    "returns": "Ranked root-cause hypotheses with evidence and suggested fixes.",
+}
+
+
+def _format_agent_tool_descriptions(extra_tools: Optional[list] = None) -> str:
     """
     Format tool definitions into a human-readable block for the agent system prompt.
+
+    Args:
+        extra_tools (Optional[list]): Additional tool definitions to append.
 
     Returns:
         Formatted string describing all available tools.
     """
     lines = []
-    for tool in AGENT_TOOL_DEFINITIONS:
+    for tool in AGENT_TOOL_DEFINITIONS + list(extra_tools or []):
         lines.append(f"### {tool['name']}")
         lines.append(f"  Description: {tool['description']}")
         if tool["parameters"]:
@@ -497,19 +514,23 @@ Examples:
 """
 
 
-def _agent_system_prompt(max_steps: int = 30) -> str:
+def _agent_system_prompt(
+    max_steps: int = 30,
+    extra_tools: Optional[list] = None,
+) -> str:
     """
     Build the full agent system prompt with tool descriptions.
 
     Args:
         max_steps (int): Maximum tool-call steps allowed.
             Defaults to 30.
+        extra_tools (Optional[list]): Optional tools enabled for this run.
 
     Returns:
         Formatted system prompt string.
     """
     return _AGENT_SYSTEM_PROMPT_TEMPLATE.format(
-        tool_descriptions=_format_agent_tool_descriptions(),
+        tool_descriptions=_format_agent_tool_descriptions(extra_tools),
         max_steps=max_steps,
     )
 

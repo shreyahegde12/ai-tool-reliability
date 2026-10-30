@@ -28,6 +28,7 @@ from tqdm import tqdm
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 
 from src.modules.ZeroShot import ZeroShot as BaseZeroShot
+from src.modules.diagnosis_engine import diagnose as run_diagnosis
 from src.modules.reliability_controller import ReliabilityController
 from src.utils.parser_utils.parsers import agent_response_parser
 from src.utils.prompt_utils.prompts_alt_patch import (
@@ -35,10 +36,19 @@ from src.utils.prompt_utils.prompts_alt_patch import (
     AGENT_INITIAL_TASK_MESSAGE,
     AGENT_NUDGE_FORMAT_MESSAGE,
     AGENT_TOOL_DEFINITIONS,
-    AGENT_CTX_ABLATION_MESSAGE
+    AGENT_CTX_ABLATION_MESSAGE,
+    DIAGNOSE_TOOL_DEFINITION,
 )
 from src.utils.token_counter import token_counter
 
+
+def _cfg_get(config: Any, name: str, default: Any) -> Any:
+    """Read a key from a dict-like or attribute-based (Hydra) config."""
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(name, default)
+    return getattr(config, name, default)
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +84,7 @@ class ToolEnvironment:
         context_prefill: bool = False,
         prefilled_instruction: Optional[str] = None,
         reliability_config: Optional[Any] = None,
+        diagnosis_config: Optional[Any] = None,
     ):
         """
         Initialize the tool environment.
@@ -97,6 +108,9 @@ class ToolEnvironment:
             context_prefill (bool): Flag to include the entire context in prompt.
             prefilled_instruction (str): Original input prompt.
             reliability_config: Reliability-controller policy settings.
+            diagnosis_config: Deterministic-diagnosis settings
+                (``enabled`` adds the diagnose tool, ``prefill`` puts the
+                initial report in the first task message).
         """
         # Immutable references
         self.original_configs = original_configs
@@ -118,6 +132,11 @@ class ToolEnvironment:
         self.reliability_controller.initialise_checkpoint_metrics(
             not_fixed=len(violated_specs)
         )
+        self.diagnosis_enabled = bool(_cfg_get(diagnosis_config, "enabled", False))
+        self.diagnosis_prefill = self.diagnosis_enabled and bool(
+            _cfg_get(diagnosis_config, "prefill", True)
+        )
+        self.diagnosis_history: List[Dict[str, Any]] = []
 
         # Mutable state: configs the agent can see and edit
         self.current_configs: Dict[str, str] = copy.deepcopy(faulty_configs)
@@ -168,6 +187,10 @@ class ToolEnvironment:
             "verify": lambda: self._tool_verify(),
             "rollback": lambda: self._tool_rollback(),
             "submit": lambda: self._tool_submit(),
+            **(
+                {"diagnose": lambda: self._tool_diagnose(source="agent")}
+                if self.diagnosis_enabled else {}
+            ),
         }.get(tool_name)
 
         reliability_decision = self.reliability_controller.before_tool(
@@ -211,6 +234,37 @@ class ToolEnvironment:
     # ------------------------------------------------------------------ #
     #                      Individual Tool Handlers                      #
     # ------------------------------------------------------------------ #
+    def _tool_diagnose(self, source: str = "agent") -> str:
+        """
+        Run deterministic consistency checks on the current network state.
+
+        The whole network is analysed (the faulty snapshot overlaid with the
+        agent's edits), but only a compact ranked summary is returned, so the
+        report does not consume the configuration context budget.
+
+        Args:
+            source (str): Who requested the diagnosis ('agent' or 'prefill').
+
+        Returns:
+            Ranked root-cause hypotheses as LLM-readable text.
+        """
+        merged = copy.deepcopy(self.full_faulty_configs)
+        merged.update(self.current_configs)
+        report = run_diagnosis(merged, self.topology, self.violated_specs)
+        self.diagnosis_history.append({
+            "source": source,
+            "timestamp": datetime.now().isoformat(),
+            "hypotheses": [
+                {
+                    "router": h.router,
+                    "check": h.primary_check,
+                    "score": round(h.score, 2),
+                }
+                for h in report.hypotheses[:5]
+            ],
+        })
+        return report.to_prompt()
+
     def _tool_list_routers(self) -> str:
         """
         List router filenames visible to the agent under the active context mode.
@@ -945,6 +999,11 @@ def _run_agent_loop(
     else:
         initial_message = AGENT_INITIAL_TASK_MESSAGE.format(max_steps=max_steps)
 
+    if environment.diagnosis_prefill:
+        initial_message += (
+            "\n\n" + environment._tool_diagnose(source="prefill")
+        )
+
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=initial_message),
@@ -1196,6 +1255,7 @@ class MiniAgent(BaseZeroShot):
         max_agent_steps: int = 30,
         verification_mode: str = "per_step",
         reliability_config: Optional[Any] = None,
+        diagnosis_config: Optional[Any] = None,
         **kwargs,
     ):
         """
@@ -1248,6 +1308,7 @@ class MiniAgent(BaseZeroShot):
         self.agent_context_mode = kwargs.get("context_sampling", "random")
         self.verification_mode = verification_mode
         self.reliability_config = reliability_config
+        self.diagnosis_config = diagnosis_config
         self.context_prefill = kwargs.get("context_prefill", False)
 
     # ------------------------------------------------------------------ #
@@ -1298,7 +1359,13 @@ class MiniAgent(BaseZeroShot):
             Aggregate statistics dictionary.
         """
         results: List[Dict[str, Any]] = []
-        agent_system_prompt = _agent_system_prompt(self.max_agent_steps)
+        extra_tools = (
+            [DIAGNOSE_TOOL_DEFINITION]
+            if _cfg_get(self.diagnosis_config, "enabled", False) else []
+        )
+        agent_system_prompt = _agent_system_prompt(
+            self.max_agent_steps, extra_tools
+        )
 
         for sample_key, sample in tqdm(
             self.eval_dataset.items(), desc="Agentic evaluation"
@@ -1428,6 +1495,7 @@ class MiniAgent(BaseZeroShot):
             context_prefill=self.context_prefill,
             prefilled_instruction=sample["instruction"] if self.context_prefill else None,
             reliability_config=self.reliability_config,
+            diagnosis_config=self.diagnosis_config,
         )
 
         # Run the agent loop
@@ -1584,6 +1652,16 @@ class MiniAgent(BaseZeroShot):
             "agent_reliability_transactions": env_summary.get(
                 "transaction_history", []
             ),
+            "agent_diagnosis_enabled": env.diagnosis_enabled,
+            "agent_diagnosis_calls": sum(
+                1 for d in env.diagnosis_history if d["source"] == "agent"
+            ),
+            "agent_diagnosis_top_router": (
+                env.diagnosis_history[0]["hypotheses"][0]["router"]
+                if env.diagnosis_history and env.diagnosis_history[0]["hypotheses"]
+                else None
+            ),
+            "agent_diagnosis_history": env.diagnosis_history,
             **context,
         }
 

@@ -15,6 +15,7 @@ RESULT_FILENAME = "zero_shot_benchmark_results.json"
 
 CSV_FIELDS = [
     "run_directory",
+    "run_id",
     "metadata_status",
     "scenario_name",
     "sample_id",
@@ -43,6 +44,13 @@ CSV_FIELDS = [
     "automatic_rollbacks",
     "selective_rollbacks",
     "forced_final_verifications",
+    "diagnosis_enabled",
+    "diagnosis_calls",
+    "diagnosis_top_router",
+    "diagnosis_top_check",
+    "diagnosis_followed",
+    "routers_changed",
+    "max_steps",
     "submitted",
     "termination_reason",
     "input_tokens",
@@ -57,6 +65,8 @@ MARKDOWN_FIELDS = [
     ("Scenario", "scenario_name"),
     ("Method", "context_sampling"),
     ("Gate", "gate_label"),
+    ("Diagnosis", "diagnosis_label"),
+    ("Run", "run_id"),
     ("Seed", "experiment_seed"),
     ("Routers", "node_count_retrieved"),
     ("Repaired", "requirements_fixed"),
@@ -98,6 +108,41 @@ def _task_evaluation(
     return _load_json(path) if path.exists() else {}
 
 
+def _changed_routers(aggregate_path: Path, sample_id: Any) -> list[str]:
+    """Routers whose final config differs from the faulty one."""
+    task_dir = aggregate_path.parent / f"Task_{sample_id}"
+    changed = []
+    for fixed in sorted((task_dir / "fix").glob("*.cfg")):
+        faulty = task_dir / "fault" / fixed.name
+        if faulty.exists() and fixed.read_text() != faulty.read_text():
+            changed.append(fixed.name)
+    return changed
+
+
+def _diagnosis_fields(
+    result: dict[str, Any],
+    changed: list[str],
+) -> dict[str, Any]:
+    history = result.get("agent_diagnosis_history") or []
+    hypotheses = history[0].get("hypotheses", []) if history else []
+    top = hypotheses[0] if hypotheses else {}
+    enabled = bool(result.get("agent_diagnosis_enabled"))
+    top_router = top.get("router")
+    if not enabled:
+        followed = None
+    elif not top_router:
+        followed = "no_finding"
+    else:
+        followed = "followed" if top_router in changed else "ignored"
+    return {
+        "diagnosis_enabled": enabled,
+        "diagnosis_calls": result.get("agent_diagnosis_calls"),
+        "diagnosis_top_router": top_router,
+        "diagnosis_top_check": top.get("check"),
+        "diagnosis_followed": followed,
+    }
+
+
 def _normalise_row(
     aggregate_path: Path,
     result: dict[str, Any],
@@ -135,8 +180,15 @@ def _normalise_row(
         and "selected_config_tokens" in result
     )
 
+    changed = _changed_routers(aggregate_path, sample_id)
+    max_steps = _path_value(aggregate_path, r"steps-(\d+)-")
+
     return {
         "run_directory": str(aggregate_path.parent),
+        "run_id": _path_value(aggregate_path, r"/run-([^/]+)-seed-[^/]+/"),
+        **_diagnosis_fields(result, changed),
+        "routers_changed": ";".join(changed),
+        "max_steps": int(max_steps) if max_steps else None,
         "metadata_status": (
             "complete" if has_context_metadata
             else "legacy_missing_context_metadata"
@@ -245,6 +297,11 @@ def _markdown_value(row: dict[str, Any], field: str) -> str:
         value = f"{latency:.1f}" if isinstance(latency, (int, float)) else ""
     elif field == "gate_label":
         value = _gate_label(row)
+    elif field == "diagnosis_label":
+        value = (
+            f"on ({row.get('diagnosis_followed')})"
+            if row.get("diagnosis_enabled") else "off"
+        )
     else:
         value = row.get(field)
     if value is None:

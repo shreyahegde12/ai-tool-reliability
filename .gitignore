@@ -14,3 +14,7 @@ invalid_runs/
 .env
 .env.*
 !.env.example
+
+# Per-run experiment logs (keep the held-out selection record)
+matrix_logs/*
+!matrix_logs/heldout_selection.json

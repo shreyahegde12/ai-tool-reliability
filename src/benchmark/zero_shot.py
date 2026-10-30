@@ -120,6 +120,9 @@ def main(config: DictConfig) -> None:
             pipeline_kwargs["reliability_config"] = getattr(
                 agentic_cfg, "reliability", None
             )
+            pipeline_kwargs["diagnosis_config"] = getattr(
+                agentic_cfg, "diagnosis", None
+            )
         
         # Initialize pipeline
         model = PIPELINES[config.pipeline_mode](
@@ -150,6 +153,30 @@ def main(config: DictConfig) -> None:
         # Clear any external tool session
         if net_env:
             net_env.cleanup()
+
+        _refresh_experiment_summary()
+
+
+def _refresh_experiment_summary() -> None:
+    """Rebuild results_main/experiment_summary.{csv,md} after every run."""
+    import subprocess
+    import sys
+
+    try:
+        root = hydra.utils.get_original_cwd()
+        subprocess.run(
+            [
+                sys.executable,
+                os.path.join(root, "scripts", "analysis", "summarize_experiments.py"),
+                os.path.join(root, "results_main"),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=300,
+        )
+        logger.info("Experiment summary refreshed")
+    except Exception as e:
+        logger.warning(f"Could not refresh experiment summary: {e}")
 
 
 if __name__ == "__main__":
