@@ -8,6 +8,7 @@ deterministic, auditable, and easy to disable for baseline experiments.
 
 from dataclasses import dataclass
 from datetime import datetime
+import math
 from typing import Any, Dict, Iterable, Mapping, Optional, Set
 
 
@@ -21,43 +22,73 @@ class ReliabilityDecision:
     feedback: str = ""
 
 
-def _config_value(config: Any, name: str, default: bool) -> bool:
-    """Read a boolean from a dict-like or attribute-based config object."""
+def _config_value(config: Any, name: str, default: Any) -> Any:
+    """Read a value from a dict-like or attribute-based config object."""
     if config is None:
         return default
     if isinstance(config, Mapping):
-        return bool(config.get(name, default))
-    return bool(getattr(config, name, default))
+        return config.get(name, default)
+    return getattr(config, name, default)
 
 
 class ReliabilityController:
     """Deterministic guard for patching, verification, and submission."""
 
     def __init__(self, config: Optional[Any] = None):
-        self.enabled = _config_value(config, "enabled", False)
-        self.require_inspection = _config_value(
+        self.enabled = bool(_config_value(config, "enabled", False))
+        self.require_inspection = bool(_config_value(
             config, "require_inspection_before_patch", True
-        )
-        self.require_verified_submit = _config_value(
+        ))
+        self.require_verified_submit = bool(_config_value(
             config, "require_verification_before_submit", True
-        )
-        self.auto_rollback = _config_value(
+        ))
+        self.auto_rollback = bool(_config_value(
             config, "auto_rollback_on_regression", True
-        )
-        self.block_repeated_failed_patch = _config_value(
+        ))
+        self.block_repeated_failed_patch = bool(_config_value(
             config, "block_repeated_failed_patch", True
-        )
-        self.force_final_verification = _config_value(
+        ))
+        self.force_final_verification = bool(_config_value(
             config, "force_final_verification", True
-        )
-        self.selective_rollback = _config_value(
+        ))
+        self.selective_rollback = bool(_config_value(
             config, "selective_rollback", True
-        )
+        ))
+
+        # Net-benefit acceptance: accept a verification if the number of
+        # newly fixed specs exceeds regressions by at least this ratio.
+        # "strict" (the default) means zero tolerance — any regression
+        # triggers rollback.  A float like 2.0 means "accept when
+        # fixed_delta >= 2 * regression_delta".
+        nb = _config_value(config, "net_benefit_ratio", "strict")
+        if isinstance(nb, str) and nb.lower() == "strict":
+            self.net_benefit_ratio: Optional[float] = None  # strict mode
+        else:
+            self.net_benefit_ratio = float(nb)
+            if (
+                not math.isfinite(self.net_benefit_ratio)
+                or self.net_benefit_ratio <= 0
+            ):
+                raise ValueError(
+                    "net_benefit_ratio must be 'strict' or a positive "
+                    "finite number"
+                )
 
         self.current_state_verified = False
         self.checkpoint_verified = False
+        self.checkpoint_fixed: int = 0
+        self.checkpoint_not_fixed: int = 0
+        self.checkpoint_side_effects: int = 0
+        self.checkpoint_score: float = 0.0
         self.failed_patch_fingerprints: Set[str] = set()
         self.decision_log = []
+
+    def initialise_checkpoint_metrics(self, *, not_fixed: int) -> None:
+        """Seed metrics for the known faulty input without marking it verified."""
+        self.checkpoint_fixed = 0
+        self.checkpoint_not_fixed = max(0, int(not_fixed))
+        self.checkpoint_side_effects = 0
+        self.checkpoint_score = 0.0
 
     @staticmethod
     def _patch_fingerprint(params: Mapping[str, Any]) -> str:
@@ -185,38 +216,162 @@ class ReliabilityController:
         verification_entry: Mapping[str, Any],
         pending_patches: Iterable[Mapping[str, Any]],
     ) -> ReliabilityDecision:
-        """Classify a completed verification and choose any enforcement action."""
+        """Classify a completed verification and choose any enforcement action.
+
+        In strict mode (``net_benefit_ratio is None``), any regression
+        triggers a rollback — the v2 behaviour.
+
+        In net-benefit mode, the controller compares the *change* in fixed
+        and regressed specs since the last checkpoint.  A verification is
+        accepted when::
+
+            fixed_delta >= net_benefit_ratio * regression_delta
+
+        where ``fixed_delta = fixed - checkpoint_fixed`` and
+        ``regression_delta = side_effects - checkpoint_side_effects``.
+        A ratio of 1.0 means "accept whenever we fix at least as many as
+        we break".  2.0 means "fix twice as many as we break".
+        """
         if not self.enabled:
             return ReliabilityDecision(True, "observe", "controller_disabled")
 
+        fixed = int(verification_entry.get("fixed", 0) or 0)
+        not_fixed = int(verification_entry.get("not_fixed", 0) or 0)
         side_effects = int(verification_entry.get("side_effects", 0) or 0)
-        if side_effects > 0 and self.auto_rollback:
-            reason = "verification_regression"
-            decision = (
-                "selective_rollback"
-                if self.selective_rollback and list(pending_patches)
-                else "auto_rollback"
-            )
-            self._record("verify", decision, reason)
+
+        # Compute deltas relative to the last committed checkpoint.
+        fixed_delta = fixed - self.checkpoint_fixed
+        regression_delta = side_effects - self.checkpoint_side_effects
+
+        if not self.auto_rollback:
+            # Rollback disabled — observe only.
+            self.current_state_verified = False
+            self._record("verify", "observe", "regressions_not_enforced")
             return ReliabilityDecision(
-                False,
-                decision,
-                reason,
-                (
-                    "Reliability controller rejected the unverified transaction "
-                    f"because verification found {side_effects} regression(s)."
-                ),
+                True, "observe", "regressions_not_enforced"
             )
+
+        accepted, acceptance_reason = self.assess_candidate(
+            fixed=fixed,
+            not_fixed=not_fixed,
+            side_effects=side_effects,
+        )
+        if accepted:
+            decision = (
+                "accept" if side_effects == 0 else "accept_net_benefit"
+            )
+            self._accept_checkpoint(fixed, not_fixed, side_effects)
+            self._record("verify", decision, acceptance_reason)
+            feedback = ""
+            if decision == "accept_net_benefit":
+                feedback = (
+                    f"Verification produced {fixed_delta:+d} additional "
+                    f"fix(es) and {regression_delta:+d} additional "
+                    "regression(s) while preserving or improving the repair "
+                    f"score. Net benefit accepted (ratio "
+                    f"{self.net_benefit_ratio})."
+                )
+            return ReliabilityDecision(
+                True,
+                decision,
+                acceptance_reason,
+                feedback,
+            )
+
+        # Regression exceeds tolerance — roll back.
+        reason = "verification_regression"
+        decision = (
+            "selective_rollback"
+            if self.selective_rollback and list(pending_patches)
+            else "auto_rollback"
+        )
+        self._record("verify", decision, reason)
+        return ReliabilityDecision(
+            False,
+            decision,
+            reason,
+            (
+                "Reliability controller rejected the unverified transaction "
+                f"because verification found {side_effects} regression(s) "
+                f"(delta +{regression_delta} from checkpoint)."
+            ),
+        )
+
+    @staticmethod
+    def _repair_score(
+        fixed: int,
+        not_fixed: int,
+        side_effects: int,
+    ) -> float:
+        denominator = fixed + not_fixed + side_effects
+        return fixed / denominator if denominator > 0 else 0.0
+
+    def assess_candidate(
+        self,
+        *,
+        fixed: int,
+        not_fixed: int,
+        side_effects: int,
+        baseline_fixed: Optional[int] = None,
+        baseline_not_fixed: Optional[int] = None,
+        baseline_side_effects: Optional[int] = None,
+    ) -> tuple[bool, str]:
+        """Return whether a verified candidate improves the trusted state."""
+        base_fixed = (
+            self.checkpoint_fixed
+            if baseline_fixed is None
+            else baseline_fixed
+        )
+        base_not_fixed = (
+            self.checkpoint_not_fixed
+            if baseline_not_fixed is None
+            else baseline_not_fixed
+        )
+        base_side_effects = (
+            self.checkpoint_side_effects
+            if baseline_side_effects is None
+            else baseline_side_effects
+        )
+        base_score = self._repair_score(
+            base_fixed, base_not_fixed, base_side_effects
+        )
+        candidate_score = self._repair_score(
+            fixed, not_fixed, side_effects
+        )
+        if candidate_score + 1e-12 < base_score:
+            return False, "repair_score_decreased"
+
+        fixed_delta = fixed - base_fixed
+        regression_delta = side_effects - base_side_effects
 
         if side_effects == 0:
-            self.current_state_verified = True
-            self.checkpoint_verified = True
-            self._record("verify", "accept", "zero_regressions")
-            return ReliabilityDecision(True, "accept", "zero_regressions")
+            return True, "zero_regressions_score_preserved"
+        if self.net_benefit_ratio is None:
+            return False, "strict_regression_rejection"
+        if regression_delta <= 0:
+            return True, "score_preserved_without_new_regressions"
+        if fixed_delta >= self.net_benefit_ratio * regression_delta:
+            return True, (
+                "net_benefit_accepted:"
+                f"+{fixed_delta}fixed/-{regression_delta}regressed"
+            )
+        return False, "net_benefit_ratio_not_met"
 
-        self.current_state_verified = False
-        self._record("verify", "observe", "regressions_not_enforced")
-        return ReliabilityDecision(True, "observe", "regressions_not_enforced")
+    def _accept_checkpoint(
+        self,
+        fixed: int,
+        not_fixed: int,
+        side_effects: int,
+    ) -> None:
+        """Update internal checkpoint tracking after accepting a state."""
+        self.current_state_verified = True
+        self.checkpoint_verified = True
+        self.checkpoint_fixed = fixed
+        self.checkpoint_not_fixed = not_fixed
+        self.checkpoint_side_effects = side_effects
+        self.checkpoint_score = self._repair_score(
+            fixed, not_fixed, side_effects
+        )
 
     def mark_failed_patches(
         self,
@@ -235,6 +390,9 @@ class ReliabilityController:
                 self._patch_fingerprint(params)
             )
         self.current_state_verified = self.checkpoint_verified
+        # Scores revert to the checkpoint's values after a rollback.
+        # (checkpoint_fixed / checkpoint_side_effects are already correct
+        #  because _accept_checkpoint only updates them on success.)
 
     def mark_selective_recovery(
         self,
@@ -242,6 +400,9 @@ class ReliabilityController:
         retained: int,
         rejected: int,
         verified: bool,
+        fixed: int = 0,
+        not_fixed: int = 0,
+        side_effects: int = 0,
     ) -> None:
         """Record completion of a selective rollback transaction."""
         if not self.enabled:
@@ -249,6 +410,12 @@ class ReliabilityController:
         self.current_state_verified = verified
         if verified:
             self.checkpoint_verified = True
+            self.checkpoint_fixed = fixed
+            self.checkpoint_not_fixed = not_fixed
+            self.checkpoint_side_effects = side_effects
+            self.checkpoint_score = self._repair_score(
+                fixed, not_fixed, side_effects
+            )
         self._record(
             "verify",
             "selective_commit",
@@ -269,6 +436,8 @@ class ReliabilityController:
         """Return aggregate enforcement metrics and the audit log."""
         return {
             "enabled": self.enabled,
+            "net_benefit_ratio": self.net_benefit_ratio,
+            "checkpoint_score": self.checkpoint_score,
             "actions_checked": len(self.decision_log),
             "actions_rejected": sum(
                 1
@@ -280,6 +449,11 @@ class ReliabilityController:
                 for item in self.decision_log
                 if item["tool"] == "submit"
                 and item["decision"] == "require_verification"
+            ),
+            "net_benefit_accepted": sum(
+                1
+                for item in self.decision_log
+                if item["decision"] == "accept_net_benefit"
             ),
             "automatic_rollbacks": sum(
                 1

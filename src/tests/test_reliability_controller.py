@@ -96,6 +96,141 @@ class ReliabilityControllerTests(unittest.TestCase):
         self.assertEqual(repeated.reason, "repeated_failed_patch")
 
 
+class NetBenefitControllerTests(unittest.TestCase):
+    """Tests for the net-benefit acceptance mode."""
+
+    def setUp(self):
+        self.config = {
+            **ENABLED,
+            "net_benefit_ratio": 1.0,
+        }
+        self.controller = ReliabilityController(self.config)
+
+    def test_net_benefit_accepts_when_fixes_exceed_regressions(self):
+        # Checkpoint starts at 0 fixed, 0 regressions.
+        decision = self.controller.evaluate_verification(
+            {"fixed": 5, "side_effects": 2},
+            [{"router": "r1.cfg", "search": "a", "replace": "b"}],
+        )
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.decision, "accept_net_benefit")
+        self.assertEqual(self.controller.checkpoint_fixed, 5)
+        self.assertEqual(self.controller.checkpoint_side_effects, 2)
+
+    def test_net_benefit_rejects_when_regressions_exceed_fixes(self):
+        decision = self.controller.evaluate_verification(
+            {"fixed": 1, "side_effects": 3},
+            [{"router": "r1.cfg", "search": "a", "replace": "b"}],
+        )
+        self.assertFalse(decision.allowed)
+        self.assertIn("rollback", decision.decision)
+
+    def test_net_benefit_uses_delta_from_checkpoint(self):
+        # Accept first verification: 5 fixed, 1 regression.
+        self.controller.evaluate_verification(
+            {"fixed": 5, "not_fixed": 5, "side_effects": 1}, []
+        )
+        self.assertEqual(self.controller.checkpoint_fixed, 5)
+        self.assertEqual(self.controller.checkpoint_side_effects, 1)
+
+        # Second verification: 8 fixed, 3 regressions.
+        # Delta: +3 fixed, +2 regressions → net benefit (3 >= 1.0 * 2).
+        decision = self.controller.evaluate_verification(
+            {"fixed": 8, "not_fixed": 2, "side_effects": 3},
+            [{"router": "r2.cfg", "search": "x", "replace": "y"}],
+        )
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.decision, "accept_net_benefit")
+
+    def test_net_benefit_rejects_when_delta_insufficient(self):
+        # Accept: 5 fixed, 1 regression.
+        self.controller.evaluate_verification(
+            {"fixed": 5, "side_effects": 1}, []
+        )
+
+        # Next: 6 fixed, 4 regressions. Delta: +1 fixed, +3 reg → reject.
+        decision = self.controller.evaluate_verification(
+            {"fixed": 6, "side_effects": 4},
+            [{"router": "r2.cfg", "search": "x", "replace": "y"}],
+        )
+        self.assertFalse(decision.allowed)
+
+    def test_net_benefit_ratio_2_requires_double(self):
+        controller = ReliabilityController({
+            **ENABLED,
+            "net_benefit_ratio": 2.0,
+        })
+        # 3 fixed, 2 regressions — ratio 1.5, below 2.0.
+        decision = controller.evaluate_verification(
+            {"fixed": 3, "side_effects": 2}, [{"router": "r1.cfg"}]
+        )
+        self.assertFalse(decision.allowed)
+
+        # 4 fixed, 2 regressions — ratio 2.0, exactly meets threshold.
+        controller2 = ReliabilityController({
+            **ENABLED,
+            "net_benefit_ratio": 2.0,
+        })
+        decision = controller2.evaluate_verification(
+            {"fixed": 4, "side_effects": 2}, [{"router": "r1.cfg"}]
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_strict_mode_rejects_any_regression(self):
+        controller = ReliabilityController(ENABLED)  # no net_benefit_ratio
+        decision = controller.evaluate_verification(
+            {"fixed": 10, "side_effects": 1},
+            [{"router": "r1.cfg"}],
+        )
+        self.assertFalse(decision.allowed)
+
+    def test_zero_regressions_always_accepted(self):
+        decision = self.controller.evaluate_verification(
+            {"fixed": 5, "not_fixed": 5, "side_effects": 0}, []
+        )
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.decision, "accept")
+
+    def test_zero_regressions_cannot_discard_previous_repairs(self):
+        self.controller.evaluate_verification(
+            {"fixed": 5, "not_fixed": 5, "side_effects": 0}, []
+        )
+        decision = self.controller.evaluate_verification(
+            {"fixed": 4, "not_fixed": 6, "side_effects": 0},
+            [{"router": "r2.cfg"}],
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "verification_regression")
+
+    def test_existing_regressions_do_not_block_later_improvement(self):
+        self.controller.evaluate_verification(
+            {"fixed": 5, "not_fixed": 5, "side_effects": 2}, []
+        )
+        decision = self.controller.evaluate_verification(
+            {"fixed": 7, "not_fixed": 3, "side_effects": 2},
+            [{"router": "r2.cfg"}],
+        )
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.decision, "accept_net_benefit")
+
+    def test_invalid_net_benefit_ratio_is_rejected(self):
+        for value in (0, -1, float("inf"), float("nan")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    ReliabilityController({
+                        **ENABLED,
+                        "net_benefit_ratio": value,
+                    })
+
+    def test_summary_tracks_net_benefit_accepted(self):
+        self.controller.evaluate_verification(
+            {"fixed": 5, "side_effects": 2}, []
+        )
+        summary = self.controller.get_summary()
+        self.assertEqual(summary["net_benefit_accepted"], 1)
+        self.assertEqual(summary["net_benefit_ratio"], 1.0)
+
+
 class ReliabilityEnvironmentTests(unittest.TestCase):
     def make_environment(self, side_effects):
         return ToolEnvironment(
@@ -124,6 +259,9 @@ class ReliabilityEnvironmentTests(unittest.TestCase):
 
     def test_regression_automatically_restores_checkpoint(self):
         env = self.make_environment(side_effects=1)
+        self.assertEqual(
+            env.reliability_controller.checkpoint_not_fixed, 1
+        )
         env.execute_tool("inspect_config", {"router_name": "r1.cfg"})
         env.execute_tool(
             "apply_patch",

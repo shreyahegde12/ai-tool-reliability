@@ -39,6 +39,7 @@ from src.utils.prompt_utils.prompts_alt_patch import (
 )
 from src.utils.token_counter import token_counter
 
+
 logger = logging.getLogger(__name__)
 
 
@@ -71,7 +72,7 @@ class ToolEnvironment:
         context_mode: str = "random",
         verification_mode: str = "per_step",
         context_prefill: bool = False,
-        prefilled_instruction: Optional[str] = None, 
+        prefilled_instruction: Optional[str] = None,
         reliability_config: Optional[Any] = None,
     ):
         """
@@ -113,6 +114,9 @@ class ToolEnvironment:
         self.prefilled_instruction = prefilled_instruction
         self.reliability_controller = ReliabilityController(
             reliability_config
+        )
+        self.reliability_controller.initialise_checkpoint_metrics(
+            not_fixed=len(violated_specs)
         )
 
         # Mutable state: configs the agent can see and edit
@@ -426,20 +430,29 @@ class ToolEnvironment:
                 f"\n{reliability_decision.feedback} "
                 "Restored the last safe checkpoint."
             )
-        # Update checkpoint if safe
-        elif entry["side_effects"] == 0:
+        elif reliability_decision.decision in ("accept", "accept_net_benefit"):
+            # Controller accepted — commit checkpoint.
             for patch in pending:
                 patch["status"] = "committed"
             self.checkpoint_configs = copy.deepcopy(self.current_configs)
             self.pending_patches = []
+            se = entry["side_effects"]
             self.transaction_history.append({
                 "status": "committed",
                 "source": source,
                 "patch_ids": [p.get("patch_id") for p in pending],
                 "fixed": entry["fixed"],
-                "side_effects": 0,
+                "side_effects": se,
             })
-            obs += "\nCheckpoint updated (no regressions detected)."
+            if se == 0:
+                obs += "\nCheckpoint updated (no regressions detected)."
+            else:
+                obs += (
+                    f"\nCheckpoint updated (net-benefit accepted: "
+                    f"{entry['fixed']} fixed, {se} regressions)."
+                )
+            if reliability_decision.feedback:
+                obs += f"\n{reliability_decision.feedback}"
 
         if entry["not_fixed"] == 0 and entry["side_effects"] == 0:
             obs += (
@@ -541,8 +554,24 @@ class ToolEnvironment:
         self,
         patches: List[Dict[str, Any]],
     ) -> str:
-        """Greedily retain patches that remain regression-free in order."""
+        """Greedily retain patches whose net effect is beneficial.
+
+        In strict mode (``net_benefit_ratio is None``), a patch is kept
+        only when it introduces zero regressions — the original v2
+        behaviour.
+
+        In net-benefit mode, a patch is kept when the improvement in
+        fixed specs outweighs the regressions by the configured ratio.
+        """
+        controller = self.reliability_controller
+        base_fixed = controller.checkpoint_fixed
+        base_not_fixed = controller.checkpoint_not_fixed
+        base_se = controller.checkpoint_side_effects
+
         candidate = copy.deepcopy(self.checkpoint_configs)
+        running_fixed = base_fixed
+        running_not_fixed = base_not_fixed
+        running_se = base_se
         retained: List[Dict[str, Any]] = []
         rejected: List[Dict[str, Any]] = []
 
@@ -557,13 +586,33 @@ class ToolEnvironment:
                 source="selective_rollback",
                 patches_count=1,
             )
-            if error or entry["side_effects"] > 0:
-                patch["status"] = "rejected_regression"
+            if error:
+                patch["status"] = "rejected_verification_error"
                 rejected.append(patch)
                 continue
-            patch["status"] = "committed_after_selective_check"
-            retained.append(patch)
-            candidate = trial
+
+            trial_fixed = int(entry.get("fixed", 0) or 0)
+            trial_not_fixed = int(entry.get("not_fixed", 0) or 0)
+            trial_se = int(entry.get("side_effects", 0) or 0)
+            accept, _ = controller.assess_candidate(
+                fixed=trial_fixed,
+                not_fixed=trial_not_fixed,
+                side_effects=trial_se,
+                baseline_fixed=running_fixed,
+                baseline_not_fixed=running_not_fixed,
+                baseline_side_effects=running_se,
+            )
+
+            if accept:
+                patch["status"] = "committed_after_selective_check"
+                retained.append(patch)
+                candidate = trial
+                running_fixed = trial_fixed
+                running_not_fixed = trial_not_fixed
+                running_se = trial_se
+            else:
+                patch["status"] = "rejected_regression"
+                rejected.append(patch)
 
         self.reliability_controller.mark_failed_patches(rejected)
         self.current_configs = candidate
@@ -572,9 +621,10 @@ class ToolEnvironment:
         self.reliability_controller.mark_selective_recovery(
             retained=len(retained),
             rejected=len(rejected),
-            # A retained candidate was verified directly. With no retained
-            # patch, the state is the unchanged trusted baseline checkpoint.
             verified=True,
+            fixed=running_fixed,
+            not_fixed=running_not_fixed,
+            side_effects=running_se,
         )
         self.transaction_history.append({
             "status": (
@@ -583,6 +633,9 @@ class ToolEnvironment:
             "source": "verification_regression",
             "retained_patch_ids": [p.get("patch_id") for p in retained],
             "rejected_patch_ids": [p.get("patch_id") for p in rejected],
+            "final_fixed": running_fixed,
+            "final_not_fixed": running_not_fixed,
+            "final_side_effects": running_se,
         })
         return (
             "Selective rollback retained "
@@ -1504,6 +1557,9 @@ class MiniAgent(BaseZeroShot):
             "agent_reliability_enabled": env_summary.get(
                 "reliability", {}
             ).get("enabled", False),
+            "agent_reliability_net_benefit_ratio": env_summary.get(
+                "reliability", {}
+            ).get("net_benefit_ratio"),
             "agent_reliability_actions_checked": env_summary.get(
                 "reliability", {}
             ).get("actions_checked", 0),
@@ -1513,6 +1569,9 @@ class MiniAgent(BaseZeroShot):
             "agent_reliability_submissions_blocked": env_summary.get(
                 "reliability", {}
             ).get("submissions_blocked", 0),
+            "agent_reliability_net_benefit_accepted": env_summary.get(
+                "reliability", {}
+            ).get("net_benefit_accepted", 0),
             "agent_reliability_auto_rollbacks": env_summary.get(
                 "reliability", {}
             ).get("automatic_rollbacks", 0),

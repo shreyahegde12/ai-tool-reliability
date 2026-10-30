@@ -37,7 +37,9 @@ CSV_FIELDS = [
     "patches_attempted",
     "rollbacks",
     "reliability_enabled",
+    "net_benefit_ratio",
     "actions_rejected",
+    "net_benefit_accepted",
     "automatic_rollbacks",
     "selective_rollbacks",
     "forced_final_verifications",
@@ -54,6 +56,7 @@ MARKDOWN_FIELDS = [
     ("Metadata", "metadata_status"),
     ("Scenario", "scenario_name"),
     ("Method", "context_sampling"),
+    ("Gate", "gate_label"),
     ("Seed", "experiment_seed"),
     ("Routers", "node_count_retrieved"),
     ("Repaired", "requirements_fixed"),
@@ -162,8 +165,16 @@ def _normalise_row(
         "patches_attempted": result.get("agent_patches_attempted"),
         "rollbacks": result.get("agent_rollbacks"),
         "reliability_enabled": result.get("agent_reliability_enabled"),
+        "net_benefit_ratio": (
+            result.get("agent_reliability_net_benefit_ratio")
+            if result.get("agent_reliability_enabled")
+            else None
+        ),
         "actions_rejected": result.get(
             "agent_reliability_actions_rejected"
+        ),
+        "net_benefit_accepted": result.get(
+            "agent_reliability_net_benefit_accepted"
         ),
         "automatic_rollbacks": result.get(
             "agent_reliability_auto_rollbacks"
@@ -211,6 +222,19 @@ def write_csv(rows: list[dict[str, Any]], output_path: Path) -> None:
         writer.writerows(rows)
 
 
+def _gate_label(row: dict[str, Any]) -> str:
+    enabled = row.get("reliability_enabled")
+    if not enabled:
+        return "off"
+    nbr = row.get("net_benefit_ratio")
+    if nbr is None or (isinstance(nbr, str) and nbr.lower() == "strict"):
+        return "strict"
+    try:
+        return f"nb{float(nbr):.1f}"
+    except (TypeError, ValueError):
+        return "on"
+
+
 def _markdown_value(row: dict[str, Any], field: str) -> str:
     value: Any
     if field == "fix_rate_display":
@@ -219,6 +243,8 @@ def _markdown_value(row: dict[str, Any], field: str) -> str:
     elif field == "latency_display":
         latency = row.get("latency_seconds")
         value = f"{latency:.1f}" if isinstance(latency, (int, float)) else ""
+    elif field == "gate_label":
+        value = _gate_label(row)
     else:
         value = row.get(field)
     if value is None:

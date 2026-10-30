@@ -18,7 +18,7 @@ pipeline_mode: "agentic"
 # External network environment configuration
 net_env:
   name: Batfish
-  keep_alive: true                 # Reuse Batfish across repeated seed runs
+  keep_alive: true                 # Reuse healthy Batfish; setup restarts it if needed
 
 # Model configuration
 model:
@@ -58,6 +58,7 @@ agentic:
     block_repeated_failed_patch: true
     force_final_verification: true
     selective_rollback: true
+    net_benefit_ratio: "strict"    # "strict" = zero-tolerance; float = accept when fixed_delta >= ratio * regression_delta
 
 # LLM-as-judge diagnosis scoring
 diagnosis_judge:
