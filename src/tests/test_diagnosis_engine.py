@@ -170,6 +170,48 @@ class DiagnoseToolTests(unittest.TestCase):
         self.assertIn("no cross-device", env.execute_tool("diagnose", {}))
         self.assertEqual(len(env.diagnosis_history), 2)
 
+    def make_partial_env(self, expand):
+        full = network(b_remote=65009)
+        return ToolEnvironment(
+            faulty_configs={"a.cfg": full["a.cfg"]},
+            original_configs={},
+            full_faulty_configs=full,
+            topology=TOPOLOGY,
+            violated_specs=[],
+            specification_csv_path=None,
+            original_specs=[],
+            net_env=None,
+            evaluator=lambda **kwargs: {},
+            evaluator_kwargs={},
+            diagnosis_config={"enabled": True, "expand_context": expand},
+        )
+
+    def test_expand_context_adds_unretrieved_diagnosed_router(self):
+        env = self.make_partial_env(expand=True)
+        report = env.execute_tool("diagnose", {})
+        self.assertIn("Added to your workspace", report)
+        self.assertEqual(env.diagnosis_added_routers, ["b.cfg"])
+        self.assertIn("b.cfg", env.current_configs)
+        self.assertIn("b.cfg", env.checkpoint_configs)
+
+        env.execute_tool("inspect_config", {"router_name": "b.cfg"})
+        result = env.execute_tool("apply_patch", {
+            "router_name": "b.cfg",
+            "search": "remote-as 65009",
+            "replace": "remote-as 65001",
+        })
+        self.assertTrue(result.startswith("Patch applied"))
+        self.assertEqual(env.patched_routers, {"b.cfg"})
+
+        env.execute_tool("diagnose", {})
+        self.assertEqual(env.diagnosis_added_routers, ["b.cfg"])
+
+    def test_expand_context_off_keeps_retrieved_set(self):
+        env = self.make_partial_env(expand=False)
+        report = env.execute_tool("diagnose", {})
+        self.assertNotIn("Added to your workspace", report)
+        self.assertNotIn("b.cfg", env.current_configs)
+
 
 if __name__ == "__main__":
     unittest.main()

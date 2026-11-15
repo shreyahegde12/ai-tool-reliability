@@ -51,6 +51,7 @@ CSV_FIELDS = [
     "diagnosis_top_router",
     "diagnosis_top_check",
     "diagnosis_followed",
+    "diagnosis_added_routers",
     "routers_changed",
     "max_steps",
     "submitted",
@@ -130,13 +131,29 @@ def _diagnosis_fields(
     top = hypotheses[0] if hypotheses else {}
     enabled = bool(result.get("agent_diagnosis_enabled"))
     top_router = top.get("router")
+    # Newer runs log every router the agent patched, including patches the
+    # gate later rolled back; older runs only have the final config diff.
+    patched = result.get("agent_routers_patched")
+    attempted = set(patched) if patched is not None else set(changed)
+    visible = set(
+        str(result.get("selected_routers") or "").split(";")
+        if isinstance(result.get("selected_routers"), str)
+        else result.get("selected_routers") or []
+    ) | set(result.get("agent_diagnosis_added_routers") or [])
     if not enabled:
         followed = None
     elif not top_router:
         followed = "no_finding"
+    elif top_router in attempted:
+        followed = "followed"
+    elif visible and top_router not in visible:
+        followed = "not_reachable"
     else:
-        followed = "followed" if top_router in changed else "ignored"
+        followed = "ignored"
     return {
+        "diagnosis_added_routers": ";".join(
+            result.get("agent_diagnosis_added_routers") or []
+        ),
         "diagnosis_enabled": enabled,
         "diagnosis_calls": result.get("agent_diagnosis_calls"),
         "diagnosis_top_router": top_router,

@@ -64,6 +64,8 @@ agentic:
   diagnosis:
     enabled: false                 # Adds the deterministic `diagnose` tool
     prefill: true                  # Put the initial report in the first task message
+    expand_context: false          # Add top diagnosed routers to the agent's workspace if retrieval missed them
+    expand_top_k: 3                # How many top-ranked diagnosed routers may be added
 
 # LLM-as-judge diagnosis scoring
 diagnosis_judge:

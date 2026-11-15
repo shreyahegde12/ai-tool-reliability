@@ -137,6 +137,15 @@ class ToolEnvironment:
             _cfg_get(diagnosis_config, "prefill", True)
         )
         self.diagnosis_history: List[Dict[str, Any]] = []
+        # Diagnosis-guided retrieval: routers the diagnosis flags are added
+        # to the agent's workspace even if retrieval did not select them.
+        self.diagnosis_expand_context = self.diagnosis_enabled and bool(
+            _cfg_get(diagnosis_config, "expand_context", False)
+        )
+        self.diagnosis_expand_top_k = int(
+            _cfg_get(diagnosis_config, "expand_top_k", 3)
+        )
+        self.diagnosis_added_routers: List[str] = []
 
         # Mutable state: configs the agent can see and edit
         self.current_configs: Dict[str, str] = copy.deepcopy(faulty_configs)
@@ -146,6 +155,7 @@ class ToolEnvironment:
 
         # Tracking
         self.inspected_routers: Set[str] = set()
+        self.patched_routers: Set[str] = set()
         self.pending_patches: List[Dict[str, Any]] = []
         self.verification_history: List[Dict[str, Any]] = []
         self.transaction_history: List[Dict[str, Any]] = []
@@ -216,6 +226,7 @@ class ToolEnvironment:
                     and result.startswith("Patch applied")
                 ):
                     self.reliability_controller.mark_patch_applied()
+                    self.patched_routers.add(str(params.get("router_name")))
         except Exception as e:
             result = f"Error executing {tool_name}: {str(e)}"
 
@@ -254,6 +265,7 @@ class ToolEnvironment:
         self.reliability_controller.set_diagnosis_evidence(
             (h.router, h.primary_check) for h in report.hypotheses
         )
+        added = self._expand_context_from_diagnosis(report.ranked_routers())
         self.diagnosis_history.append({
             "source": source,
             "timestamp": datetime.now().isoformat(),
@@ -265,8 +277,42 @@ class ToolEnvironment:
                 }
                 for h in report.hypotheses[:5]
             ],
+            "added_routers": added,
         })
-        return report.to_prompt()
+        prompt = report.to_prompt()
+        if added:
+            prompt += (
+                "\nAdded to your workspace (not in the initial context): "
+                + ", ".join(added)
+                + ". You can inspect and patch them."
+            )
+        return prompt
+
+    def _expand_context_from_diagnosis(self, ranked: List[str]) -> List[str]:
+        """
+        Make the top diagnosed routers inspectable and patchable.
+
+        Args:
+            ranked (List[str]): Routers ranked by the diagnosis engine.
+
+        Returns:
+            Routers newly added to the workspace by this call.
+        """
+        if not self.diagnosis_expand_context:
+            return []
+        added = []
+        for router in ranked[: self.diagnosis_expand_top_k]:
+            if (
+                router in self.current_configs
+                or router not in self.full_faulty_configs
+            ):
+                continue
+            config = self.full_faulty_configs[router]
+            self.current_configs[router] = config
+            self.checkpoint_configs[router] = config
+            self.diagnosis_added_routers.append(router)
+            added.append(router)
+        return added
 
     def _tool_list_routers(self) -> str:
         """
@@ -814,6 +860,7 @@ class ToolEnvironment:
         return {
             "total_tool_calls": len(self.tool_call_log),
             "routers_inspected": sorted(self.inspected_routers),
+            "routers_patched": sorted(self.patched_routers),
             "total_patches_attempted": sum(
                 1 for log in self.tool_call_log if log["tool"] == "apply_patch"
             ),
@@ -1516,6 +1563,10 @@ class MiniAgent(BaseZeroShot):
         for filename, config_text in fixed_results.items():
             with open(os.path.join(self.fix_dir, filename), "w") as f:
                 f.write(config_text)
+        # Routers added by diagnosis also need their faulty version on disk
+        for filename in env.diagnosis_added_routers:
+            with open(os.path.join(self.fault_dir, filename), "w") as f:
+                f.write(self.full_faulty_configs[filename])
 
         # Save agent metadata
         self._save_agent_metadata(agent_metadata)
@@ -1671,6 +1722,8 @@ class MiniAgent(BaseZeroShot):
                 else None
             ),
             "agent_diagnosis_history": env.diagnosis_history,
+            "agent_diagnosis_added_routers": env.diagnosis_added_routers,
+            "agent_routers_patched": env_summary.get("routers_patched", []),
             **context,
         }
 
@@ -1773,9 +1826,12 @@ class MiniAgent(BaseZeroShot):
                 return {"fix_evaluation": verification["evaluation"]}
 
         # Agent never verified — run evaluation now
+        # Compare against the full snapshot so routers added to the
+        # workspace by diagnosis count as changes too
+        baseline = {**self.full_faulty_configs, **self.faulty_configs}
         no_changes = all(
-            fixed_results.get(name, content) == content
-            for name, content in self.faulty_configs.items()
+            baseline.get(name) == content
+            for name, content in fixed_results.items()
         )
         if no_changes:
             all_specs = self.original_specs or []
