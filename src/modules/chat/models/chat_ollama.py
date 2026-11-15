@@ -159,20 +159,29 @@ class _ChatOllama(BaseChat):
             logger.info(f"Sending {len(messages)} messages to Ollama API")
             logger.info(f"Starting generate request to Ollama model...")
                         
+            # Sampling settings must go under "options"; Ollama ignores them
+            # at the top level. num_gpu=0 would force CPU-only inference on
+            # Apple Silicon, so only pass it when CUDA GPUs were detected.
+            options = {
+                "num_predict": self.max_tokens,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "num_ctx": self.num_ctx,
+            }
+            if self.num_gpu:
+                options["num_gpu"] = self.num_gpu
+
             # Send an API request to the 'generate' endpoint
             response = requests.post(
                 f"{self.api_base}/api/generate",
                 json={
                     "model": self.model_name,
                     "prompt": prompt_messages,
-                    "num_predict": self.max_tokens,
-                    "temperature": self.temperature,
-                    "top_p": self.top_p,
-                    "num_ctx": self.num_ctx,
-                    "num_gpu": self.num_gpu,
+                    "options": options,
+                    "think": False,
                     "stream": False,
                 },
-                timeout=100
+                timeout=600
             )
                         
             # Process the response
