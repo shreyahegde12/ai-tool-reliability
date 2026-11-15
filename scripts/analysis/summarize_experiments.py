@@ -44,6 +44,8 @@ CSV_FIELDS = [
     "automatic_rollbacks",
     "selective_rollbacks",
     "forced_final_verifications",
+    "evidence_alignment",
+    "evidence_nudges",
     "diagnosis_enabled",
     "diagnosis_calls",
     "diagnosis_top_router",
@@ -237,6 +239,10 @@ def _normalise_row(
         "forced_final_verifications": result.get(
             "agent_reliability_forced_final_verifications"
         ),
+        "evidence_alignment": result.get(
+            "agent_reliability_evidence_alignment"
+        ),
+        "evidence_nudges": result.get("agent_reliability_evidence_nudges"),
         "submitted": result.get("agent_submitted"),
         "termination_reason": result.get("agent_terminated_reason"),
         "input_tokens": result.get("task_input_tokens"),
@@ -282,9 +288,12 @@ def _gate_label(row: dict[str, Any]) -> str:
     if nbr is None or (isinstance(nbr, str) and nbr.lower() == "strict"):
         return "strict"
     try:
-        return f"nb{float(nbr):.1f}"
+        label = f"nb{float(nbr):.1f}"
     except (TypeError, ValueError):
-        return "on"
+        label = "on"
+    if str(row.get("evidence_alignment")).lower() == "true":
+        label += "+evidence"
+    return label
 
 
 def _markdown_value(row: dict[str, Any], field: str) -> str:

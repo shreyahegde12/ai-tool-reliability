@@ -59,6 +59,8 @@ agentic:
     force_final_verification: true
     selective_rollback: true
     net_benefit_ratio: "strict"    # "strict" = zero-tolerance; float = accept when fixed_delta >= ratio * regression_delta
+    evidence_alignment: false      # Nudge once before patching a router the diagnosis did not flag
+    evidence_top_k: 3              # How many top-ranked diagnosis routers count as flagged
   diagnosis:
     enabled: false                 # Adds the deterministic `diagnose` tool
     prefill: true                  # Put the initial report in the first task message

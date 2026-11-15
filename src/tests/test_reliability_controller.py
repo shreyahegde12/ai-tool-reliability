@@ -49,6 +49,54 @@ class ReliabilityControllerTests(unittest.TestCase):
         )
         self.assertTrue(decision.allowed)
 
+    def test_evidence_alignment_nudges_once_per_unflagged_router(self):
+        self.controller = ReliabilityController(
+            {**ENABLED, "evidence_alignment": True}
+        )
+        self.controller.set_diagnosis_evidence(
+            [("r2.cfg", "bgp_local_asn_mismatch")]
+        )
+        decision = self.check("apply_patch", self.patch, inspected={"r1.cfg"})
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.decision, "evidence_nudge")
+        self.assertIn("r2.cfg", decision.feedback)
+
+        decision = self.check("apply_patch", self.patch, inspected={"r1.cfg"})
+        self.assertTrue(decision.allowed)
+        summary = self.controller.get_summary()
+        self.assertEqual(summary["evidence_nudges"], 1)
+        self.assertEqual(summary["actions_rejected"], 0)
+
+    def test_evidence_alignment_allows_flagged_or_after_inspection(self):
+        self.controller = ReliabilityController(
+            {**ENABLED, "evidence_alignment": True}
+        )
+        self.controller.set_diagnosis_evidence(
+            [("r1.cfg", "link_subnet_mismatch"), ("r2.cfg", "duplicate_address")]
+        )
+        decision = self.check("apply_patch", self.patch, inspected={"r1.cfg"})
+        self.assertTrue(decision.allowed)
+
+        other = dict(self.patch, router_name="r3.cfg")
+        decision = self.check(
+            "apply_patch", other, inspected={"r2.cfg", "r3.cfg"}
+        )
+        self.assertTrue(decision.allowed)
+
+    def test_evidence_alignment_inactive_without_findings_or_flag(self):
+        self.controller = ReliabilityController(
+            {**ENABLED, "evidence_alignment": True}
+        )
+        decision = self.check("apply_patch", self.patch, inspected={"r1.cfg"})
+        self.assertTrue(decision.allowed)
+
+        self.controller = ReliabilityController(ENABLED)
+        self.controller.set_diagnosis_evidence(
+            [("r2.cfg", "bgp_local_asn_mismatch")]
+        )
+        decision = self.check("apply_patch", self.patch, inspected={"r1.cfg"})
+        self.assertTrue(decision.allowed)
+
     def test_prefilled_config_counts_as_visible(self):
         decision = self.check("apply_patch", self.patch, prefill=True)
         self.assertTrue(decision.allowed)

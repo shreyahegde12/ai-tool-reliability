@@ -251,6 +251,9 @@ class ToolEnvironment:
         merged = copy.deepcopy(self.full_faulty_configs)
         merged.update(self.current_configs)
         report = run_diagnosis(merged, self.topology, self.violated_specs)
+        self.reliability_controller.set_diagnosis_evidence(
+            (h.router, h.primary_check) for h in report.hypotheses
+        )
         self.diagnosis_history.append({
             "source": source,
             "timestamp": datetime.now().isoformat(),
@@ -1649,6 +1652,12 @@ class MiniAgent(BaseZeroShot):
             "agent_reliability_forced_final_verifications": env_summary.get(
                 "reliability", {}
             ).get("forced_final_verifications", 0),
+            "agent_reliability_evidence_alignment": env_summary.get(
+                "reliability", {}
+            ).get("evidence_alignment", False),
+            "agent_reliability_evidence_nudges": env_summary.get(
+                "reliability", {}
+            ).get("evidence_nudges", 0),
             "agent_reliability_transactions": env_summary.get(
                 "transaction_history", []
             ),

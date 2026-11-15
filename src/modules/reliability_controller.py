@@ -9,7 +9,7 @@ deterministic, auditable, and easy to disable for baseline experiments.
 from dataclasses import dataclass
 from datetime import datetime
 import math
-from typing import Any, Dict, Iterable, Mapping, Optional, Set
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 
 @dataclass(frozen=True)
@@ -54,6 +54,14 @@ class ReliabilityController:
         self.selective_rollback = bool(_config_value(
             config, "selective_rollback", True
         ))
+        # Evidence alignment: before the first patch on a router that the
+        # deterministic diagnosis did not flag, ask the agent to look at the
+        # flagged routers first.  It is a one-time nudge per router, not a
+        # block, because the diagnosis can be wrong.
+        self.evidence_alignment = bool(_config_value(
+            config, "evidence_alignment", False
+        ))
+        self.evidence_top_k = int(_config_value(config, "evidence_top_k", 3))
 
         # Net-benefit acceptance: accept a verification if the number of
         # newly fixed specs exceeds regressions by at least this ratio.
@@ -81,7 +89,45 @@ class ReliabilityController:
         self.checkpoint_side_effects: int = 0
         self.checkpoint_score: float = 0.0
         self.failed_patch_fingerprints: Set[str] = set()
+        self.flagged_routers: List[Tuple[str, str]] = []
+        self.evidence_nudged_routers: Set[str] = set()
         self.decision_log = []
+
+    def set_diagnosis_evidence(
+        self,
+        flagged: Iterable[Tuple[str, str]],
+    ) -> None:
+        """Store the latest diagnosis as ranked (router, check) pairs."""
+        self.flagged_routers = list(flagged)[: self.evidence_top_k]
+
+    def _evidence_nudge(
+        self,
+        router_name: str,
+        inspected: Set[str],
+        context_prefill: bool,
+    ) -> Optional[str]:
+        """Return nudge feedback if this patch ignores the diagnosis."""
+        if not self.evidence_alignment or not self.flagged_routers:
+            return None
+        flagged_names = {router for router, _ in self.flagged_routers}
+        if (
+            router_name in flagged_names
+            or router_name in self.evidence_nudged_routers
+        ):
+            return None
+        if not context_prefill and flagged_names & inspected:
+            return None
+        self.evidence_nudged_routers.add(router_name)
+        evidence = ", ".join(
+            f"{router} ({check})" for router, check in self.flagged_routers
+        )
+        return (
+            f"Reliability check paused this patch: '{router_name}' was not "
+            f"flagged by the deterministic diagnosis, which points to: "
+            f"{evidence}. Inspect the flagged router(s) first. If you still "
+            "believe this router is the cause, explain why and resubmit the "
+            "same patch; it will be allowed."
+        )
 
     def initialise_checkpoint_metrics(self, *, not_fixed: int) -> None:
         """Seed metrics for the known faulty input without marking it verified."""
@@ -162,6 +208,12 @@ class ReliabilityController:
                     reason,
                     "Reliability check rejected this patch: it makes no change.",
                 )
+
+            nudge = self._evidence_nudge(router_name, inspected, context_prefill)
+            if nudge:
+                reason = "unflagged_router"
+                self._record(tool_name, "evidence_nudge", reason)
+                return ReliabilityDecision(False, "evidence_nudge", reason, nudge)
 
             fingerprint = self._patch_fingerprint(params)
             if (
@@ -438,6 +490,12 @@ class ReliabilityController:
             "enabled": self.enabled,
             "net_benefit_ratio": self.net_benefit_ratio,
             "checkpoint_score": self.checkpoint_score,
+            "evidence_alignment": self.evidence_alignment,
+            "evidence_nudges": sum(
+                1
+                for item in self.decision_log
+                if item["decision"] == "evidence_nudge"
+            ),
             "actions_checked": len(self.decision_log),
             "actions_rejected": sum(
                 1
