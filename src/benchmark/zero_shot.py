@@ -123,6 +123,7 @@ def main(config: DictConfig) -> None:
             pipeline_kwargs["diagnosis_config"] = getattr(
                 agentic_cfg, "diagnosis", None
             )
+            pipeline_kwargs["timeout"] = getattr(agentic_cfg, "timeout", 1200)
         
         # Initialize pipeline
         model = PIPELINES[config.pipeline_mode](

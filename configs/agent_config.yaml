@@ -48,6 +48,7 @@ model:
 # Agentic-specific configuration
 agentic:
   max_steps: 30                    # Maximum tool-call steps per scenario
+  timeout: 1200                    # Wall-clock limit per scenario (s); raise for slow local models
   verification_mode: "per_step"    # Options: 'per_step', 'post_hoc'
   context_prefill: True            # True or False for ablation
   reliability:
