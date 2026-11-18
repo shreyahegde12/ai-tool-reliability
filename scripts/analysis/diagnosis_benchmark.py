@@ -36,6 +36,7 @@ EXPECTED_CHECK = {
     "interface_ip_wrong": "link_subnet_mismatch",
     "interface_shutdown": "interface_shutdown",
     "ospf_disabled": "ospf_link_not_enabled",
+    "neighbor_shutdown": "bgp_neighbor_shutdown",
 }
 
 
@@ -144,6 +145,17 @@ def ospf_disabled(config, rng):
     return "\n".join(lines)
 
 
+def neighbor_shutdown(config, rng):
+    ips = re.findall(r"^ neighbor (\d+\.\d+\.\d+\.\d+) (?:remote-as|peer-group)", config, re.M)
+    if not ips:
+        return None
+    ip = rng.choice(ips)
+    return re.sub(
+        rf"^( neighbor {re.escape(ip)} (?:remote-as|peer-group).*)$",
+        rf"\1\n neighbor {ip} shutdown", config, count=1, flags=re.M,
+    )
+
+
 MUTATORS = {
     "wrong_local_asn": wrong_local_asn,
     "wrong_remote_as": wrong_remote_as,
@@ -152,6 +164,7 @@ MUTATORS = {
     "interface_ip_wrong": interface_ip_wrong,
     "interface_shutdown": interface_shutdown,
     "ospf_disabled": ospf_disabled,
+    "neighbor_shutdown": neighbor_shutdown,
 }
 
 

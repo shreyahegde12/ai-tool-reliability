@@ -34,6 +34,7 @@ CHECK_WEIGHTS = {
     "ospf_link_not_enabled": 6.0,
     "bgp_prefix_not_advertised": 6.0,
     "bgp_session_not_reciprocated": 3.0,
+    "bgp_neighbor_shutdown": 8.0,
 }
 
 _TOP_LEVEL_HEADERS = (
@@ -75,6 +76,8 @@ class RouterModel:
     static_local_prefixes: List[Tuple[ipaddress.IPv4Network, str]] = field(
         default_factory=list
     )
+    # 'neighbor X shutdown' lines, keyed by neighbor IP or peer-group name.
+    neighbor_shutdown: Dict[str, str] = field(default_factory=dict)
 
     def effective_remote_as(self, neighbor: BgpNeighbor) -> Optional[int]:
         if neighbor.remote_as is not None:
@@ -193,6 +196,9 @@ def _parse_bgp_line(model: RouterModel, line: str) -> None:
     if parts[0] != "neighbor" or len(parts) < 3:
         return
     target, keyword = parts[1], parts[2]
+    if keyword == "shutdown":
+        model.neighbor_shutdown[target] = line
+        return
     if not _is_ip(target):
         if keyword == "peer-group" and len(parts) == 3:
             model.peer_groups.setdefault(target, None)
@@ -310,6 +316,7 @@ class DiagnosisEngine:
         self.findings = []
         self._check_duplicate_addresses()
         self._check_bgp_peering()
+        self._check_neighbor_shutdown()
         if self.topology is not None:
             self._check_links()
         self._check_prefix_origination()
@@ -398,6 +405,18 @@ class DiagnosisEngine:
                 f"remote-as {expected}, but {owner} runs AS {local}",
                 f"set remote-as {local} for neighbor {neighbor.ip} on {name}",
             ))
+
+    def _check_neighbor_shutdown(self) -> None:
+        for name, model in self.models.items():
+            if model.bgp_asn is None:
+                continue
+            for target, line in model.neighbor_shutdown.items():
+                self.findings.append(Finding(
+                    name,
+                    "bgp_neighbor_shutdown",
+                    f"{name}: '{line}' administratively disables the session",
+                    f"remove 'neighbor {target} shutdown' on {name}",
+                ))
 
     def _check_links(self) -> None:
         node_to_router, _ = _router_index(self.configs, self.topology)

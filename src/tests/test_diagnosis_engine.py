@@ -132,6 +132,14 @@ class DiagnosisTests(unittest.TestCase):
         }
         self.assertEqual(routers, {"a.cfg", "b.cfg"})
 
+    def test_neighbor_shutdown(self):
+        configs = network()
+        configs["b.cfg"] = configs["b.cfg"].replace(
+            " address-family ipv4", " neighbor 10.181.0.0 shutdown\n address-family ipv4", 1
+        )
+        top = self.top(configs)
+        self.assertEqual((top.router, top.primary_check), ("b.cfg", "bgp_neighbor_shutdown"))
+
     def test_prompt_mentions_router_and_fix(self):
         text = diagnose(network(b_remote=65009), TOPOLOGY).to_prompt()
         self.assertIn("b.cfg", text)
