@@ -2,27 +2,34 @@
 
 An independent research project by Shreya Hegde for improving the reliability of LLM agents that diagnose and repair network configurations.
 
-The project studies two complementary problems:
+The central question is how to let an agent repair broken parts of a network without breaking the parts that already work. The harness wraps a ReAct-style repair agent in three deterministic layers:
 
-- **Dependency-aware retrieval** selects router configurations using violated specifications, prefix ownership, topology paths, waypoints, and neighboring routers.
-- **Action reliability** checks configuration edits before execution, tracks patch outcomes, requires verification, and rolls back unsafe changes.
+1. **Dependency-aware retrieval** selects router configurations using violated specifications, prefix ownership, topology paths, waypoints and neighbouring routers. Routers flagged by the diagnosis can be added to the workspace when retrieval missed them.
+2. **Deterministic diagnosis** runs rule-based cross-device consistency checks (BGP peering and ASNs, neighbor shutdown, link addressing, duplicate addresses, interface state, OSPF adjacency, prefix origination) and gives the agent ranked root-cause hypotheses with evidence. It uses only what the agent is allowed to see, never ground truth.
+3. **Reliability gate** checks edits before execution, requires verification, accepts a patch only if it repairs more than it breaks (net-benefit rule), rolls back regressing patches selectively, forces a final verification, and pauses once before the agent patches a router the diagnosis did not flag.
 
-Candidate repairs are evaluated against formal network-behavior specifications using Batfish. This is experimental research software and is not intended for direct use on production networks.
+Candidate repairs are evaluated against formal network-behaviour specifications using Batfish. This is experimental research software and is not intended for direct use on production networks.
 
-## Current research questions
+## Design status
 
-1. Can network-semantic retrieval expose more relevant configurations than random context selection?
-2. Can an action-validation layer reduce regressions without preventing useful repairs?
-3. How do retrieval and reliability interact across scenarios, seeds, and context budgets?
+The harness design is frozen. Experiments compare:
+
+- **Base agent:** the same agent, prompts, tools, model and budget with all three layers switched off (random context selection).
+- **Full system:** all three layers switched on.
+
+Both conditions use gpt-4o-mini, 20 steps, a 12k-token context cap, 1,200 output tokens and per-step verification, unless an experiment states otherwise.
 
 ## Repository highlights
 
-- `src/utils/context_utils/dependency_retrieval.py` — dependency-aware router ranking and selection.
-- `src/modules/reliability_controller.py` — pre-action checks and post-verification recovery policy.
-- `src/modules/MiniAgent.py` — agent/tool integration, patch checkpoints, verification, and rollback.
-- `scripts/benchmark/run_reliability_v2_matrix.sh` — reproducible experiment matrix.
-- `scripts/analysis/summarize_experiments.py` — CSV and Markdown result summaries.
-- `src/tests/` — unit tests for retrieval and reliability behavior.
+- `src/utils/context_utils/dependency_retrieval.py`: dependency-aware router ranking and selection.
+- `src/modules/diagnosis_engine.py`: deterministic fault localisation.
+- `src/modules/reliability_controller.py`: pre-action checks, net-benefit acceptance, rollback and evidence nudge.
+- `src/modules/MiniAgent.py`: agent and tool integration, patch checkpoints, verification and rollback.
+- `scripts/benchmark/run_diagnosis_ablation.sh`: experiment runner for base agent, full system and ablations.
+- `scripts/analysis/summarize_experiments.py`: CSV and Markdown result summaries.
+- `scripts/analysis/diagnosis_benchmark.py`: offline fault-injection benchmark for the diagnosis (no LLM, no Batfish).
+- `scripts/analysis/diagnosis_coverage.py`: how often the diagnosis finds something across all scenarios.
+- `src/tests/`: unit tests for retrieval, diagnosis and reliability behaviour.
 
 ## Setup
 
@@ -41,7 +48,7 @@ Add the required provider API key to `.env`, then download the public benchmark 
 python download_dataset.py
 ```
 
-Start the customized Batfish container:
+Start the customised Batfish container:
 
 ```bash
 bash scripts/batfish_setup/pull_and_run_container.sh
@@ -50,34 +57,28 @@ bash scripts/batfish_setup/pull_and_run_container.sh
 ## Tests
 
 ```bash
-.venv312/bin/python -m unittest \
-  src.tests.test_dependency_retrieval \
-  src.tests.test_reliability_controller -v
+.venv312/bin/python -m unittest discover -s src/tests -t . -v
 ```
 
-## Example experiment
+## Running experiments
+
+Base agent on one scenario:
 
 ```bash
-.venv312/bin/python -m src.benchmark.zero_shot \
-  --config-name agent_config \
-  'data.scenario_filter=["scenario-006"]' \
-  experiment.run_id=s006-dependency-reliability-r1 \
-  data.seed=42 \
-  model.provider=openai \
-  model.model_name=gpt-4o-mini \
-  model.max_tokens=1200 \
-  model.context_sampling=spec_dependency \
-  model.max_context_tokens=12000 \
-  agentic.max_steps=12 \
-  agentic.verification_mode=per_step \
-  agentic.context_prefill=false \
-  agentic.reliability.enabled=true \
-  diagnosis_judge.enabled=false
+SCENARIOS="031" SEEDS="42" CONDITIONS=diagoff CONTEXT=random RUN_TAG=baseline-v1 \
+  bash scripts/benchmark/run_diagnosis_ablation.sh
 ```
 
-Each run uses a unique output directory derived from its run ID and seed. Generated datasets, API credentials, and experiment outputs are excluded from Git.
+Full system on the same scenario:
 
-Summarize completed experiments with:
+```bash
+SCENARIOS="031" SEEDS="42" CONDITIONS=diagon EXPAND=true GATE=1.0 EVIDENCE=true \
+  RUN_TAG=heldout-full-v2 bash scripts/benchmark/run_diagnosis_ablation.sh
+```
+
+`GATE` takes `off`, `strict` or a net-benefit ratio; `PROVIDER`, `MODEL` and `EXTRA` select other models or pass further Hydra overrides. Each run writes to a unique directory derived from its run ID and seed, and existing results are skipped, so an interrupted batch can be restarted. Generated datasets, API credentials and experiment outputs are excluded from Git.
+
+Summarise completed experiments with:
 
 ```bash
 .venv312/bin/python scripts/analysis/summarize_experiments.py results_main
@@ -85,4 +86,4 @@ Summarize completed experiments with:
 
 ## Attribution and licence
 
-This project builds on third-party open-source research software and benchmark data. Required attribution, upstream sources, citations, and licence details are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The software is distributed under the MIT licence in [LICENSE](LICENSE).
+This project builds on third-party open-source research software and benchmark data, including the Cornetto benchmark and its agent. Required attribution, upstream sources, citations and licence details are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The software is distributed under the MIT licence in [LICENSE](LICENSE).
